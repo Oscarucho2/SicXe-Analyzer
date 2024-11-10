@@ -1,2 +1,0 @@
-COPY    START   1000
-
