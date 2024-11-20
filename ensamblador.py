@@ -3,7 +3,7 @@ import re
 import tkinter as tk
 from tkinter import filedialog
 from tkinter.scrolledtext import ScrolledText
-
+from SIC_XE_Loader import SIC_XE_Loader
 class EditorConNumerosLinea(tk.Frame):
     def __init__(self, master=None):
         super().__init__(master)
@@ -47,7 +47,7 @@ TABOP = {
     'JEQ': (0x30, 3), 'JGT': (0x34, 3), 'JLT': (0x38, 3),
     'J': (0x3C, 3), 'JSUB': (0x48, 3), 'RSUB': (0x4C, 3),
     'LDCH': (0x50, 3), 'STCH': (0x54, 3),'LDT': (0x0A,3),
-    
+    'LDB': (0x68, 3),
     '+LDA': (0x00, 4), '+LDX': (0x04, 4), '+LDL': (0x08, 4),
     '+STA': (0x0C, 4), '+STX': (0x10, 4), '+STL': (0x14, 4),
     '+ADD': (0x18, 4), '+SUB': (0x1C, 4), '+MUL': (0x20, 4),
@@ -55,13 +55,15 @@ TABOP = {
     '+JEQ': (0x30, 4), '+JGT': (0x34, 4), '+JLT': (0x38, 4),
     '+J': (0x3C, 4), '+JSUB': (0x48, 4), '+RSUB': (0x4C, 4),
     '+LDCH': (0x50, 4), '+STCH': (0x54, 4),'+LDT': (0x0A,4),
+    '+LDB': (0x68, 3),
 
     'WORD': (None, 'directiva'), 'BYTE': (None, 'directiva'),
     'START': (None, 'directiva'), 'END': (None, 'directiva'),
     'RESW': (None, 'directiva'), 'RESB': (None, 'directiva'),
     'EQU': (None, 'directiva'), 'USE': (None, 'directiva'),
-    'ORG': (None, 'directiva'),
-
+    'ORG': (None, 'directiva'),'EXTREF': (None, 'directiva'),
+    'EXTDEF': (None, 'directiva'),'CSECT': (None, 'directiva'),
+    'BASE': (None, 'directiva'), 
     # Instrucciones de formato 1
     'FIX': (0xC4, 1), 'FLOAT': (0xC0, 1), 'NORM': (0xC8, 1),
     'SIO': (0xF0, 1), 'HIO': (0xF4, 1), 'TIO': (0xF8, 1),
@@ -81,6 +83,10 @@ contador_loc_bloques = {bloque_actual: 0x0000}  # Contador LOCCTR por bloque
 # Modificar la tabla de símbolos para incluir el bloque
 tabla_simbolos = {}  # Simbolo: (Direccion, Tipo, Bloque)
 nombre_programa_global = None
+nombre_seccion_actual = None
+referencias_externas = []
+definiciones_externas = []
+ruta_archivo_actual = None
 
 def evaluar_expresion(expresion, tabla_simbolos):
     # Tokenizamos la expresión, separando números, operadores y paréntesis
@@ -188,11 +194,57 @@ def generar_registro_texto(inicio, codigos_objeto):
     longitud = len(codigos_objeto) // 2
     return f"T{inicio:06X}{longitud:02X}{codigos_objeto}"
 
+def generar_registro_modificacion_WORD(direccion, simbolo):
+    # Registro M inicia con 'M', dirección de modificación y longitud (ejemplo: 05, significa 5 bytes)
+    return f"M{direccion:06X}05+{simbolo}"
+
 def generar_registro_modificacion(direccion):
-    return f"M{direccion:06X}05" + "+" + nombre_programa_global  # Longitud 5 bytes para formato 4
+    return f"M{direccion:06X}05" + "+" + nombre_seccion_actual  # Longitud 5 bytes para formato 4
+
+def generar_registro_extdef(definiciones_externas, tabla_simbolos):
+    registros_extdef = []
+    registro_actual = "D"
+    
+    for definicion in definiciones_externas:
+        # Usa 0 como valor predeterminado si el símbolo no tiene dirección en tabla_simbolos
+        direccion_relativa = tabla_simbolos.get(definicion, {}).get('CP', 0)
+        registro_actual += definicion.ljust(6)[:6]  # Nombre del símbolo
+        registro_actual += hex(direccion_relativa)[2:].upper().zfill(6)  # Dirección relativa en hexadecimal
+
+        if len(registro_actual) > 73:
+            registros_extdef.append(registro_actual[:73])
+            registro_actual = "D"
+
+    if len(registro_actual) > 1:
+        registros_extdef.append(registro_actual)
+    
+    return registros_extdef
+
+
+def generar_registro_extref(referencias_externas):
+    registros_extref = []
+    registro_actual = "R"
+    
+    for referencia in referencias_externas:
+        registro_actual += referencia.ljust(6)[:6]  # Nombre del símbolo referenciado
+
+        # Si el registro actual supera 73 caracteres, iniciamos un nuevo registro
+        if len(registro_actual) > 73:
+            registros_extref.append(registro_actual[:73])
+            registro_actual = "R"
+
+    if len(registro_actual) > 1:
+        registros_extref.append(registro_actual)
+    
+    return registros_extref
 
 def generar_registro_fin(inicio):
     return f"E{inicio:06X}"
+
+def extraer_simbolos_operacion(operacion):
+    import re
+    return re.findall(r'\b[A-Z][A-Z0-9]*\b', operacion)
+
 
 def evaluar_expresion_equ(expresion, tabla_simbolos, contador_loc):
     """
@@ -265,11 +317,10 @@ def procesar_directiva_use(operando, contador_loc, tabla_bloques):
     return tabla_bloques[bloque_actual]['LOCCTR']
 
 
-def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, codigos_texto, codigos_objeto, tabla_bloques):
+def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, codigos_texto, codigos_objeto, tabla_bloques, registros_extdef, registros_extref):
     global bloque_actual
-
+    global referencias_externas  
     partes = linea.split()
-    print(linea)
     # Desglose de línea
     if len(partes) == 3:
         etiqueta, instruccion, operando = partes
@@ -285,6 +336,7 @@ def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, 
     resultado = {'CP': f"{tabla_bloques[bloque_actual]['LOCCTR']:04X}"}
     codigo_objeto = ''
 
+    print(linea)
     # Si hay una etiqueta, agregarla a la tabla de símbolos
     if etiqueta:
         if etiqueta in tabla_simbolos:
@@ -299,8 +351,41 @@ def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, 
         if 'etiquetas' not in tabla_bloques[bloque_actual]:
             tabla_bloques[bloque_actual]['etiquetas'] = []
         tabla_bloques[bloque_actual]['etiquetas'].append(etiqueta)
+        
+    if instruccion == 'EXTREF':
+        if operando:
+            referencias_externas = [ref.strip() for ref in operando.replace(" ", "").split(',')]
+            registros_extref.append(generar_registro_extref(referencias_externas))
+        else:
+            return {'Error': "Error: La directiva EXTREF requiere al menos un operando."}
 
-  # Directiva EQU
+        resultado.update({
+            'Instrucción': 'EXTREF',
+            'Operando': operando,
+            'Bloque': bloque_actual,
+            'Etiqueta': etiqueta or '',
+            'Código Objeto': ''
+        })
+        return resultado
+
+
+    if instruccion == 'EXTDEF':
+        if operando:
+            definiciones_externas = [defin.strip() for defin in operando.replace(" ", "").split(',')]
+            registros_extdef.append(generar_registro_extdef(definiciones_externas, tabla_simbolos))
+        else:
+            return {'Error': "Error: La directiva EXTDEF requiere al menos un operando."}
+
+        resultado.update({
+            'Instrucción': 'EXTDEF',
+            'Operando': operando,
+            'Bloque': bloque_actual,
+            'Etiqueta': etiqueta or '',
+            'Código Objeto': ''
+        })
+        return resultado
+
+    # Directiva EQU
     if instruccion == 'EQU':
         try:
             # Evaluar la expresión del operando
@@ -367,11 +452,11 @@ def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, 
         if codigo_operacion is not None:  # Instrucción válida
             if not validar_sintaxis(instruccion, operando, formato):
                 return {'Error': "Error de sintaxis en los operandos"}
-            codigo_objeto, tipo_simbolo = ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, registros_modificacion)
+            codigo_objeto, tipo_simbolo = ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, registros_modificacion, registros_extdef, registros_extref)
 
         else:  # Directivas como BYTE, WORD
             if instruccion in ['BYTE', 'WORD']:  # Verifica si la instrucción es BYTE o WORD
-                codigo_objeto, tipo_simbolo = ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, registros_modificacion)
+                codigo_objeto, tipo_simbolo = ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, registros_modificacion, registros_extdef, registros_extref)
             else:
                 codigo_objeto = "Directiva"
     else:
@@ -389,6 +474,21 @@ def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, 
             codigos_texto.append(registro_texto)
             codigos_objeto.clear()
             
+    # Validación y manejo de etiquetas EXTDEF y EXTREF en operaciones
+    if instruccion != 'WORD' and operando:
+        simbolos_en_operacion = extraer_simbolos_operacion(operando)
+        for simbolo in simbolos_en_operacion:
+            if simbolo in referencias_externas or simbolo in [definicion[0] for definicion in registros_extdef]:
+                return {'Error': f"Error: El símbolo '{simbolo}' está definido como referencia externa y no puede usarse en la instrucción {instruccion}"}
+
+    elif instruccion == 'WORD' and operando:
+        simbolos_en_operacion = extraer_simbolos_operacion(operando)
+        for simbolo in simbolos_en_operacion:
+            if simbolo in referencias_externas or simbolo in [definicion[0] for definicion in registros_extdef]:
+                # Generar registro de modificación para cada símbolo externo
+                registros_modificacion.append(generar_registro_modificacion_WORD(tabla_bloques[bloque_actual]['LOCCTR'], simbolo))
+
+            
     resultado.update({
         'Etiqueta': etiqueta if etiqueta else '',
         'Instrucción': instruccion,
@@ -396,7 +496,6 @@ def procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, 
         'Código Objeto': codigo_objeto if codigo_objeto != "Directiva" else '',
         'Bloque': bloque_actual
     })
-
     return resultado
 
 
@@ -419,7 +518,44 @@ def validar_sintaxis(instruccion, operando, formato):
         return operando is not None
     return False
 
-def ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, registros_modificacion):
+def evaluar_expresion_word(operando, tabla_simbolos, extdef, extref):
+    if extdef is None:
+        extdef = []
+    if extref is None:
+        extref = []
+
+    # Dividir la expresión en tokens de operadores y símbolos
+    tokens = re.split(r'(\+|\-|\*|\/)', operando.replace(" ", ""))
+    resultado = 0
+    operacion_actual = '+'
+    
+    for token in tokens:
+        if token in '+-*/':
+            operacion_actual = token
+        else:
+            if token in tabla_simbolos:
+                valor = tabla_simbolos[token]
+            elif token in extdef or token in extref:
+                valor = 0  # Las etiquetas en EXTDEF o EXTREF se consideran como 0000
+            else:
+                return '', "Error: Símbolo no definido en la expresión"
+            
+            # Realizar la operación según el operador actual
+            if operacion_actual == '+':
+                resultado += valor
+            elif operacion_actual == '-':
+                resultado -= valor
+            elif operacion_actual == '*':
+                resultado *= valor
+            elif operacion_actual == '/':
+                if valor == 0:
+                    return '', "Error: División por cero en la expresión"
+                resultado //= valor  # División entera
+        
+    tipo_direccion = "Relativo" if any(token in extdef or token in extref for token in tokens) else "Absoluto"
+    return resultado, tipo_direccion
+
+def ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, registros_modificacion,registros_extdef, registros_extref):
     global bloque_actual  # Para acceder al bloque actual
     
     # Verificar si la instrucción está en TABOP
@@ -439,17 +575,17 @@ def ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, r
         else:
             return '', "Error: Formato de operando inválido para BYTE"
 
-    # Instrucción WORD
-    elif instruccion == 'WORD':
-        if any(op in operando for op in '+-*/'):
-            valor, tipo_direccion = evaluar_expresion_equ(operando, tabla_simbolos, contador_loc)
-            if tipo_direccion == "Error":
-                return '', "Error: Evaluación de expresión fallida"
-        else:
-            valor = int(operando)
-            tipo_direccion = "Absoluto"
+    # elif instruccion == 'WORD':
+    #     if any(op in operando for op in '+-*/'):
+    #         valor, tipo_direccion = evaluar_expresion_word(operando, tabla_simbolos, registros_extdef, registros_extref)
+    #         if tipo_direccion == "Error":
+    #             return '', "Error: Evaluación de expresión fallida"
+    #     else:
+    #         valor = int(operando)
+    #         tipo_direccion = "Absoluto"
 
-        return f"{valor:06X}", tipo_direccion
+    #     # Asegurarse de que valor sea un entero antes de formatearlo como hexadecimal
+    #     return f"{int(valor):06X}", tipo_direccion
 
     # Para instrucciones de formato 2
     codigo_operacion, formato = TABOP[instruccion]
@@ -527,15 +663,18 @@ def ensamblar_instruccion(instruccion, operando, tabla_simbolos, contador_loc, r
 
     return '', "Error: Instrucción no soportada"
 
+numero_bloque = 0  # Inicializar contador global de bloques
 
-def escribir_archivo_salida(text_widget, lineas_procesadas, tabla_simbolos, registros_modificacion, codigos_texto, registro_encabezado, registro_fin, tabla_bloques):
-    text_widget.delete(1.0, tk.END)  # Limpiar el contenido del text_widget antes de escribir
+
+def escribir_archivo_salida(text_widget, lineas_procesadas, tabla_simbolos, registros_modificacion, codigos_texto, registro_encabezado, registro_fin, tabla_bloques, registros_extdef, registros_extref):
+    # Agregar título para la nueva sección
+    text_widget.insert(tk.END, "\n" + "="*80 + f"\nSección: {registro_encabezado[1:7].strip()}\n" + "="*80 + "\n")
     
-    # Escribir archivo intermedio
+    # Archivo Intermedio
     text_widget.insert(tk.END, "Archivo Intermedio:\n")
     text_widget.insert(tk.END, "CP".ljust(8) + "Etiqueta".ljust(12) + "Instrucción".ljust(12) + "Operando".ljust(12) + "Bloque".ljust(8) + "Código Objeto".ljust(12) + "   Errores".ljust(12) + "\n")
     text_widget.insert(tk.END, "="*80 + "\n")
-    
+
     for linea in lineas_procesadas:
         if 'Error' in linea:
             text_widget.insert(tk.END, f"{linea.get('CP', '').ljust(8)}{linea.get('Etiqueta', '').ljust(12)}{linea.get('Instrucción', '').ljust(12)}{linea.get('Operando', '').ljust(12)}{linea.get('Bloque', '').ljust(8)}{linea.get('Código Objeto', '').ljust(12)}{linea['Error'].ljust(12)}\n")
@@ -546,33 +685,45 @@ def escribir_archivo_salida(text_widget, lineas_procesadas, tabla_simbolos, regi
     text_widget.insert(tk.END, "\nTabla de Símbolos:\n")
     text_widget.insert(tk.END, "Símbolo".ljust(12) + "Dirección".ljust(12) + "Tipo".ljust(12) + "Bloque\n")
     text_widget.insert(tk.END, "="*40 + "\n")
-    
+
     for simbolo, (direccion, tipo, bloque) in tabla_simbolos.items():
         direccion_formateada = hex(direccion)[2:].upper().zfill(4)
         text_widget.insert(tk.END, f"{simbolo.ljust(12)}{direccion_formateada.ljust(12)}{tipo.ljust(12)}{bloque}\n")
-    
+
     # Tabla de bloques
     text_widget.insert(tk.END, "\nTabla de Bloques:\n")
     text_widget.insert(tk.END, "Bloque".ljust(12) + "Número".ljust(12) + "LOCCTR Inicial".ljust(16) + "Tamaño\n")
     text_widget.insert(tk.END, "="*52 + "\n")
-    
+
     for bloque, info in tabla_bloques.items():
-        numero_bloque = str(info['NUMERO'])
-        locctr_inicial = hex(info['LOCCTR'])[2:].upper().zfill(4)
-        tamano = hex(info['TAMANO'])[2:].upper().zfill(4)
+        numero_bloque = str(info.get('NUMERO', '0'))  # Manejar errores si NUMERO no existe
+        locctr_inicial = hex(info.get('LOCCTR', 0))[2:].upper().zfill(4)
+        tamano = hex(info.get('TAMANO', 0))[2:].upper().zfill(4)
         text_widget.insert(tk.END, f"{bloque.ljust(12)}{numero_bloque.ljust(12)}{locctr_inicial.ljust(16)}{tamano}\n")
-    
+
     # Tamaño total del programa
     tamano_total = sum(info['TAMANO'] for info in tabla_bloques.values())
     text_widget.insert(tk.END, "\nTamaño total del programa: " + hex(tamano_total)[2:].upper().zfill(4) + " bytes\n")
 
-    # Escribir registros de encabezado, texto y fin
+# Registros de objeto
     text_widget.insert(tk.END, "\nRegistros de objeto:\n")
     text_widget.insert(tk.END, f"{registro_encabezado}\n")
-    for registro in codigos_texto:
-        text_widget.insert(tk.END, f"{registro}\n")
-    for registro in registros_modificacion:
-        text_widget.insert(tk.END, f"{registro}\n")
+
+    # Función auxiliar para aplanar listas y manejar elementos únicos
+    def insertar_registros(lista_registros):
+        for registro in lista_registros:
+            if isinstance(registro, list):
+                for subregistro in registro:
+                    text_widget.insert(tk.END, f"{subregistro}\n")
+            else:
+                text_widget.insert(tk.END, f"{registro}\n")
+
+    # Inserta los registros procesando cada tipo
+    insertar_registros(registros_extdef)
+    insertar_registros(registros_extref)
+    insertar_registros(codigos_texto)
+    insertar_registros(registros_modificacion)
+
     text_widget.insert(tk.END, f"{registro_fin}\n")
 
 def leer_archivo_entrada(ruta_archivo):
@@ -580,20 +731,35 @@ def leer_archivo_entrada(ruta_archivo):
         return archivo.readlines()
 
 def abrir_archivo(text_widget):
-    ruta_archivo = filedialog.askopenfilename(filetypes=[("Archivos de texto", "*.txt")])
-    if ruta_archivo:
-        with open(ruta_archivo, 'r') as archivo:
+    global ruta_archivo_actual
+    nueva_ruta = filedialog.askopenfilename(filetypes=[("Archivos de texto", "*.txt")])
+    if nueva_ruta:
+        ruta_archivo_actual = nueva_ruta
+        with open(ruta_archivo_actual, 'r') as archivo:
             contenido = archivo.read()
+        # Limpiar el widget antes de insertar el contenido del nuevo archivo
         text_widget.delete(1.0, tk.END)
         text_widget.insert(tk.END, contenido)
-
+        
 def guardar_archivo(text_widget):
-    ruta_archivo = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Archivos de texto", "*.txt")])
-    if ruta_archivo:
-        with open(ruta_archivo, 'w') as archivo:
+    global ruta_archivo_actual
+    if ruta_archivo_actual:
+        with open(ruta_archivo_actual, 'w') as archivo:
+            archivo.write(text_widget.get(1.0, tk.END))
+    else:
+        # Si no hay un archivo abierto, pedir una nueva ubicación para guardar
+        guardar_como_archivo(text_widget)
+
+def guardar_como_archivo(text_widget):
+    global ruta_archivo_actual
+    ruta_archivo_actual = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Archivos de texto", "*.txt")])
+    if ruta_archivo_actual:
+        with open(ruta_archivo_actual, 'w') as archivo:
             archivo.write(text_widget.get(1.0, tk.END))
 
 def ensamblador(text_widget_entrada):
+    import tkinter as tk
+    global nombre_seccion_actual
     # Crear una nueva ventana para la salida
     ventana_salida = tk.Toplevel()
     ventana_salida.title("Resultados del Ensamblador")
@@ -605,96 +771,153 @@ def ensamblador(text_widget_entrada):
     # Obtener el contenido del widget de entrada y dividirlo en líneas
     lineas = text_widget_entrada.get("1.0", tk.END).strip().splitlines()
     
+    secciones = {}
     registros_modificacion = []
     codigos_texto = []
+    registros_extref = []
+    registros_extdef = []
     codigos_objeto = []
     lineas_procesadas = []
     contador_loc = 0x0000 
     bloque_actual = 'DEFAULT'
-    inicio_programa = contador_loc
+    tabla_bloques = {'DEFAULT': {'BASE': 0, 'LOCCTR': 0, 'TAMANO': 0}}
+    tabla_simbolos = {}
+    inicio_programa = 0
     nombre_programa = None
-    global nombre_programa_global
+    nombre_seccion_actual = None
 
-    # Verifica la primera línea para obtener el nombre del programa
-    if lineas:
-        primera_linea = lineas[0].split()
-        if len(primera_linea) == 3 and primera_linea[1] == 'START':
-            nombre_programa = primera_linea[0][:6].ljust(6)
-            nombre_programa_global = primera_linea[0][:6].ljust(6)
+    def calcular_tamanos_bloques():
+        locctr_acumulado = 0
+        for bloque, info in tabla_bloques.items():
+            if locctr_acumulado == 0:
+                info['TAMANO'] = info['LOCCTR'] - info.get('BASE', 0)
+            else:
+                info['TAMANO'] = info['LOCCTR'] - info.get('BASE', 0)
+                info['LOCCTR'] += locctr_acumulado
+            locctr_acumulado += info['TAMANO']
 
-    for linea in lineas:
-        resultado = procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, codigos_texto, codigos_objeto, tabla_bloques)
+    def procesar_seccion():
+        if nombre_seccion_actual:
+            # Calcular tamaños de bloques antes de guardar la sección
+            calcular_tamanos_bloques()
+            
+            secciones[nombre_seccion_actual] = {
+                'tabla_simbolos': tabla_simbolos.copy(),
+                'tabla_bloques': tabla_bloques.copy(),
+                'registros_modificacion': registros_modificacion[:],
+                'codigos_texto': codigos_texto[:],
+                'codigos_objeto': codigos_objeto[:],
+                'lineas_procesadas': lineas_procesadas[:],
+            }
+            
+            # Generar registros de encabezado y fin para la sección
+            registro_encabezado = generar_registro_encabezado(
+                nombre_seccion_actual, inicio_programa, contador_loc - inicio_programa
+            )
+            registro_fin = generar_registro_fin(inicio_programa)
+            # Escribir resultados en el widget de salida
+            text_widget_salida.insert(tk.END, f"Sección: {nombre_seccion_actual}\n")
+            escribir_archivo_salida(
+                text_widget_salida,
+                lineas_procesadas,
+                tabla_simbolos,
+                registros_modificacion,
+                codigos_texto,
+                registro_encabezado,
+                registro_fin,
+                tabla_bloques,
+                registros_extdef,
+                registros_extref
+            )
+            text_widget_salida.insert(tk.END, "\n")
+
+    for idx, linea in enumerate(lineas):
+        if not linea.strip():
+            continue  # Saltar líneas vacías
+        
+        tokens = linea.split()
+        instruccion = tokens[1] if len(tokens) > 1 else None
+
+        # Manejo de START para la primera sección
+        if idx == 0 and instruccion == 'START':
+            nombre_programa = tokens[0][:6].ljust(6)
+            nombre_seccion_actual = nombre_programa
+            inicio_programa = int(tokens[2], 16)
+            contador_loc = inicio_programa
+            continue
+
+        # Manejo de CSECT para iniciar una nueva sección
+        if instruccion == 'CSECT':
+            procesar_seccion()  # Procesar la sección actual antes de iniciar una nueva
+            nombre_seccion_actual = tokens[0]
+            tabla_simbolos = {}
+            tabla_bloques = {'DEFAULT': {'BASE': 0, 'LOCCTR': 0, 'TAMANO': 0}}
+            registros_modificacion = []
+            codigos_texto = []
+            codigos_objeto = []
+            lineas_procesadas = []
+            registros_extdef = []
+            registros_extref = []
+            contador_loc = 0x0000
+            bloque_actual = 'DEFAULT'
+            inicio_programa = contador_loc
+            continue
+
+        resultado = procesar_linea(linea, contador_loc, tabla_simbolos, registros_modificacion, codigos_texto, codigos_objeto, tabla_bloques, registros_extdef, registros_extref)
         if 'Error' not in resultado:
             lineas_procesadas.append(resultado)
             
             formato = TABOP.get(resultado['Instrucción'], [None, None])[1]
             
             if resultado['Instrucción'] == 'RESB':
-                # Incrementar contador_loc según el operando
-                try:
-                    valor_resb = int(resultado['Operando'])  # Obtener el operando como entero
-                    contador_loc += valor_resb  # Incrementar el CP
-                except ValueError:
-                    resultado['Error'] = "Error: Operando inválido para RESB"
-                    lineas_procesadas.append(resultado)
-                    continue
-                
+                contador_loc += int(resultado['Operando'])
+            elif resultado['Instrucción'] == 'EXTREF':
+                contador_loc += 0
+            elif resultado['Instrucción'] == 'EXTDEF':
+                contador_loc += 0
             elif resultado['Instrucción'] == 'RESW':
-                # Incrementar contador_loc según el operando multiplicado por 3
-                try:
-                    valor_resw = int(resultado['Operando']) * 3  # Multiplicar por 3
-                    contador_loc += valor_resw  # Incrementar el CP
-                except ValueError:
-                    resultado['Error'] = "Error: Operando inválido para RESW"
-                    lineas_procesadas.append(resultado)
-                    continue
-            
+                contador_loc += int(resultado['Operando']) * 3
             else:
-                if formato == 1:
-                    contador_loc += 1
-                elif formato == 2:
-                    contador_loc += 2
-                elif formato == 3 or formato == 4:
-                    contador_loc += 3 if formato == 3 else 4
+                contador_loc += 1 if formato == 1 else 2 if formato == 2 else 3 if formato == 3 else 4
             
-            # Actualizar el LOCCTR del bloque actual
             tabla_bloques[bloque_actual]['LOCCTR'] = contador_loc
         else:
-            resultado['Instrucción'] = linea.split()[0]  
             lineas_procesadas.append(resultado)
 
-    # Inicializar una variable para rastrear el LOCCTR acumulado
-    locctr_acumulado = 0
-
-    for bloque, info in tabla_bloques.items():
-        # Calcular el tamaño del bloque actual
-        if locctr_acumulado == 0:
-            # Primer bloque, simplemente calcular el tamaño
-            info['TAMANO'] = info['LOCCTR'] - info.get('BASE', 0)
-        else:
-            # Bloques subsiguientes, sumar al LOCCTR acumulado el tamaño del bloque anterior
-            info['TAMANO'] = info['LOCCTR'] - info.get('BASE', 0)  # Calcular el tamaño del bloque
-            info['LOCCTR'] += locctr_acumulado  # Sumar el tamaño del bloque anterior al LOCCTR del bloque actual
-
-        # Actualizar el LOCCTR acumulado
-        locctr_acumulado += info['TAMANO']
-
-    # Generar el encabezado y fin
-    if codigos_objeto:
-        registro_texto = generar_registro_texto(contador_loc, ''.join(codigos_objeto))
-        codigos_texto.append(registro_texto)
-
-    # Usar el nombre del programa si fue detectado; de lo contrario, usar "PROG" por defecto
-    nombre_programa = nombre_programa if nombre_programa else "PROG".ljust(6)
+    # Procesar la última sección al finalizar
+    procesar_seccion()
     
-    registro_encabezado = generar_registro_encabezado(nombre_programa, inicio_programa, contador_loc - inicio_programa)
-    registro_fin = generar_registro_fin(inicio_programa)
+from tkinter import ttk
 
-    # Escribir el archivo de salida en el widget de salida
-    text_widget_salida.delete("1.0", tk.END)  # Limpiar el contenido antes de escribir
-    escribir_archivo_salida(text_widget_salida, lineas_procesadas, tabla_simbolos, registros_modificacion, codigos_texto, registro_encabezado, registro_fin, tabla_bloques)
-
-
+def ejecutar_cargador_ligador():
+    root = tk.Tk()
+    root.title("Configuración Inicial")
+    root.geometry("400x200")
+    
+    # Variable para capturar la dirección inicial
+    dirprog_var = tk.StringVar(value="0000")
+    
+    ttk.Label(root, text="Dirección Inicial (Hex):").pack(pady=10)
+    dir_entry = ttk.Entry(root, width=10, textvariable=dirprog_var)
+    dir_entry.pack(pady=10)
+    
+    # Etiqueta para mensajes de error
+    error_label = ttk.Label(root, text="", foreground="red")
+    error_label.pack()
+    
+    def iniciar_loader():
+        try:
+            entered_value = dir_entry.get()  # Capturar directamente desde el Entry
+            print(f"Valor ingresado desde Entry: {entered_value}")
+            dirprog = int(entered_value, 16)
+            print("Dirección Inicial (Hex):", f"{dirprog:04X}")
+            root.destroy()
+            SIC_XE_Loader(dirprog).run_gui()
+        except ValueError:
+            error_label.config(text="Error: Dirección inicial inválida. Ingrese un valor hexadecimal válido.")
+    ttk.Button(root, text="Iniciar Cargador-Ligador", command=iniciar_loader).pack(pady=20)
+    root.mainloop()
+    
 def crear_editor():
     root = tk.Tk()
     root.title("Editor de Ensamblador")
@@ -709,6 +932,7 @@ def crear_editor():
     menu.add_cascade(label="Archivo", menu=archivo_menu)
     archivo_menu.add_command(label="Abrir", command=lambda: abrir_archivo(editor.text_widget))
     archivo_menu.add_command(label="Guardar", command=lambda: guardar_archivo(editor.text_widget))
+    archivo_menu.add_command(label="Guardar como...", command=lambda: guardar_como_archivo(editor.text_widget))
     archivo_menu.add_separator()
     archivo_menu.add_command(label="Salir", command=root.quit)
     
@@ -716,7 +940,12 @@ def crear_editor():
     menu.add_cascade(label="Ensamblador", menu=ensamblador_menu)
     ensamblador_menu.add_command(label="Ejecutar Ensamblador", command=lambda: ensamblador(editor.text_widget))
     
+    cargar_ligador_menu = tk.Menu(menu, tearoff=0)
+    menu.add_cascade(label="Cargador-Ligador", menu=cargar_ligador_menu)
+    cargar_ligador_menu.add_command(label="Ejecutar Cargador-Ligador", command=ejecutar_cargador_ligador)
+
     root.mainloop()
+
 
 # Ejecutar el editor
 crear_editor()
